@@ -1,1 +1,85 @@
-
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Z. STORE Orders</title>
+<?!= include('Styles') ?>
+</head>
+<body>
+<div id="bar" class="bar" hidden></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="login" class="login" hidden>
+  <div class="lg-bg" aria-hidden="true">
+    <span class="orb o1"></span><span class="orb o2"></span><span class="orb o3"></span>
+    <span class="sp s1"></span><span class="sp s2"></span><span class="sp s3"></span><span class="sp s4"></span><span class="sp s5"></span>
+    <span class="fl f1">&#128230;</span><span class="fl f2">&#128176;</span><span class="fl f3">&#128666;</span><span class="fl f4">&#9989;</span><span class="fl f5">&#128230;</span><span class="fl f6">&#128200;</span>
+  </div>
+  <div class="lg-wrap">
+    <section class="lg-hero">
+      <div class="lg-badge">&#128230; ORDER PORTAL</div>
+      <h1 class="lg-title">Z.<span> STORE</span></h1>
+      <p class="lg-sub">Orders, tracking aur commission &mdash; sab kuch ek hi jagah.</p>
+      <div class="lg-rot" aria-hidden="true"><span>&#128230; Har order, ek click door</span><span>&#128666; Parcel ka live pata</span><span>&#128200; Sales ka poora jaiza</span><span>&#128176; Commission ka saaf hisaab</span></div>
+      <ul class="lg-feat">
+        <li><b>&#128666;</b><div><strong>Live Tracking</strong><small>Ek click mein parcel track</small></div></li>
+        <li><b>&#128176;</b><div><strong>Commission &amp; Payments</strong><small>Apna hisaab hamesha saaf</small></div></li>
+        <li><b>&#128202;</b><div><strong>Smart Dashboard</strong><small>Orders ka poora jaiza</small></div></li>
+      </ul>
+      <div class="lg-road"><span class="truck">&#128666;</span></div>
+      <div class="lg-chips"><span>&#128274; Secure</span><span>&#9889; Fast</span><span>&#128241; Mobile ready</span></div>
+    </section>
+    <div class="lg-glow"><div class="login-card">
+      <div class="lg-avatar">&#128274;</div>
+      <div class="logo">Z. STORE</div>
+      <div class="lg-greet" id="lg-greet">Assalam o Alaikum &#128075;</div>
+      <h2 class="lg-hi">Welcome back!</h2>
+      <p class="muted lg-note">Apne account mein sign in karein</p>
+      <div id="login-err" class="alert err" hidden></div>
+      <label class="lg-field">Username
+        <span class="lg-in"><i>&#128100;</i><input id="lu" placeholder="username likhein" autocomplete="username" autocapitalize="none" spellcheck="false"></span>
+      </label>
+      <label class="lg-field">Password
+        <span class="lg-in"><i>&#128273;</i><input id="lp" type="password" placeholder="password likhein" autocomplete="current-password"><button type="button" class="lg-eye" aria-label="Show password" onclick="var i=document.getElementById('lp');i.type=i.type==='password'?'text':'password';this.innerHTML=i.type==='password'?'&#128065;':'&#128584;'">&#128065;</button></span>
+      </label>
+      <button id="lb" class="btn gold block">Sign in &rarr;</button>
+      <p class="muted small lg-foot">&#128737;&#65039; Secure login &middot; Password bhool gaye? Admin se reset karwayein.</p>
+    </div></div>
+  </div>
+</div>
+<div id="app" hidden>
+  <aside id="side" class="side"></aside>
+  <div class="main">
+    <header class="top"><button id="menu" class="btn ghost menu" aria-label="Menu">☰</button><div id="demo" class="demo" hidden>DEMO MODE — sample data only</div><div id="who" class="who"></div></header>
+    <main id="view" class="view" tabindex="-1"></main>
+  </div>
+</div>
+<div id="modals"></div>
+<div id="print-area"></div>
+<div id="jserr" class="alert err" hidden style="position:fixed;left:0;right:0;bottom:0;z-index:300;margin:0;word-break:break-word"></div>
+<script>
+window.onerror = function (m, u, l) { var e = document.getElementById('jserr'); if (e) { e.hidden = false; e.textContent = 'Screen error (send this message to support): ' + m + ' [line ' + l + ']'; } };
+window.addEventListener('unhandledrejection', function (ev) { var e = document.getElementById('jserr'); if (e) { e.hidden = false; e.textContent = 'Error: ' + (ev.reason && ev.reason.message || ev.reason); } });
+</script>
+<script>
+(function () {
+  try {
+    var h = new Date().getHours(), g = document.getElementById('lg-greet');
+    if (g) g.innerHTML = (h < 5 ? 'Raat gaye tak kaam? &#127769;' : h < 12 ? 'Subah bakhair &#9728;&#65039;' : h < 17 ? 'Dopahar bakhair &#127774;' : h < 20 ? 'Shaam bakhair &#127751;' : 'Raat bakhair &#127769;');
+    var card = document.querySelector('.lg-glow'), box = document.getElementById('login');
+    if (card && box && window.matchMedia && !window.matchMedia('(pointer: coarse)').matches && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      box.addEventListener('mousemove', function (e) {
+        var r = box.getBoundingClientRect(), x = (e.clientX - r.left) / r.width - 0.5, y = (e.clientY - r.top) / r.height - 0.5;
+        card.style.transform = 'perspective(900px) rotateY(' + (x * 7).toFixed(2) + 'deg) rotateX(' + (-y * 7).toFixed(2) + 'deg)';
+      });
+      box.addEventListener('mouseleave', function () { card.style.transform = ''; });
+    }
+  } catch (e) {}
+})();
+</script>
+<?!= include('App') ?>
+</body>
+</html>
