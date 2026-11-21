@@ -1,0 +1,566 @@
+<script>
+(function () {
+'use strict';
+var S = { token: null, meta: null, view: '', f: { orders: { page: 1 }, audit: { page: 1 }, sorders: { page: 1 } }, cache: {} };
+var $ = function (s, r) { return (r || document).querySelector(s); };
+function esc(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function money(n) { return (n === '' || n == null) ? '—' : 'Rs ' + Number(n).toLocaleString('en-PK', { maximumFractionDigits: 2 }); }
+function chip(s) { return '<span class="chip ' + esc(s) + '">' + esc(s) + '</span>'; }
+function uid(p) { var a = new Uint8Array(12); (window.crypto || window.msCrypto).getRandomValues(a); return p + Array.prototype.map.call(a, function (b) { return ('0' + b.toString(16)).slice(-2); }).join(''); }
+function isAdmin() { return S.meta && S.meta.user.role === 'admin'; }
+function isStaff() { return S.meta && S.meta.user.role === 'staff'; }
+function homeView() { return isAdmin() ? 'dash' : (isStaff() ? 'stdash' : 'sdash'); }
+function store(k, v) { try { if (v == null) sessionStorage.removeItem(k); else sessionStorage.setItem(k, v); } catch (e) {} }
+function load(k) { try { return sessionStorage.getItem(k); } catch (e) { return null; } }
+
+/* ---------- server calls ---------- */
+var busyN = 0;
+function busy(d) { busyN += d; $('#bar').hidden = busyN <= 0; }
+function call(action, payload) {
+  return new Promise(function (res, rej) {
+    busy(1);
+    google.script.run
+      .withSuccessHandler(function (r) {
+        busy(-1);
+        if (r && r.ok) return res(r.data);
+        if (r && r.code === 'AUTH') signOutLocal(r.error);
+        var e = new Error((r && r.error) || 'Request failed'); e.code = r && r.code; rej(e);
+      })
+      .withFailureHandler(function () { busy(-1); rej(new Error('Connection problem. Please check your internet and retry.')); })
+      .api(S.token, action, payload || {});
+  });
+}
+function toast(msg, err) {
+  var t = document.createElement('div'); t.className = 'toast' + (err ? ' err' : ''); t.textContent = msg; $('#toasts').appendChild(t);
+  setTimeout(function () { t.remove(); }, err ? 7000 : 3500);
+}
+function fail(e) { toast(e.message || 'Error', true); }
+
+/* ---------- modals ---------- */
+var modals = [];
+function modal(o) {
+  var ov = document.createElement('div'); ov.className = 'ov';
+  ov.innerHTML = '<div class="modal ' + (o.wide ? 'wide' : '') + '" role="dialog" aria-modal="true"><div class="mh"><h3>' + esc(o.title) + '</h3><button class="btn ghost sm" data-x aria-label="Close">✕</button></div><div class="mb">' + o.html + '</div><div class="mf"></div></div>';
+  var m = { el: ov, close: function () { ov.remove(); modals = modals.filter(function (x) { return x !== m; }); } };
+  (o.actions || []).forEach(function (a) {
+    var b = document.createElement('button'); b.className = 'btn ' + (a.cls || ''); b.textContent = a.label;
+    b.onclick = function () { var r = a.fn(m, b); if (r && r.then) { b.disabled = true; r.then(function () { b.disabled = false; }, function () { b.disabled = false; }); } };
+    $('.mf', ov).appendChild(b);
+  });
+  ov.addEventListener('click', function (e) { if (e.target === ov || e.target.hasAttribute('data-x')) m.close(); });
+  $('#modals').appendChild(ov); modals.push(m);
+  var f = $('input,select,textarea', ov); if (f) f.focus();
+  return m;
+}
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && modals.length) modals[modals.length - 1].close(); });
+function confirmDlg(msg, label, danger) {
+  return new Promise(function (res) {
+    modal({ title: 'Please confirm', html: '<p>' + esc(msg) + '</p>', actions: [
+      { label: 'Cancel', cls: 'ghost', fn: function (m) { m.close(); res(false); } },
+      { label: label || 'Confirm', cls: danger ? 'danger' : 'gold', fn: function (m) { m.close(); res(true); } }] });
+  });
+}
+function vals(root) {
+  var o = {}; root.querySelectorAll('[name]').forEach(function (el) { o[el.name] = el.type === 'checkbox' ? el.checked : el.value; }); return o;
+}
+
+/* ---------- form builders ---------- */
+function field(label, name, val, extra) { return '<label>' + esc(label) + '<input name="' + name + '" value="' + esc(val) + '" ' + (extra || '') + '></label>'; }
+var COURIER_DEFAULTS = ['TCS', 'Leopards', 'PostEx', 'Post Office'];
+function combo(label, name, opts, val, ph) {
+  var seen = {}, list = [];
+  (opts || []).forEach(function (x) { var k = String(x).trim().toLowerCase(); if (k && !seen[k]) { seen[k] = 1; list.push(String(x).trim()); } });
+  return '<label>' + esc(label) + '<input name="' + name + '" value="' + esc(val) + '" list="dl_' + name + '" placeholder="' + esc(ph || '') + '" autocomplete="off"><datalist id="dl_' + name + '">' +
+    list.map(function (x) { return '<option value="' + esc(x) + '"></option>'; }).join('') + '</datalist></label>';
+}
+function sel(label, name, opts, val, blank) {
+  var h = '<label>' + esc(label) + '<select name="' + name + '">' + (blank != null ? '<option value="">' + esc(blank) + '</option>' : '');
+  opts.forEach(function (o) { var v = Array.isArray(o) ? o[0] : o, l = Array.isArray(o) ? o[1] : o; h += '<option value="' + esc(v) + '"' + (String(v) === String(val) ? ' selected' : '') + '>' + esc(l) + '</option>'; });
+  return h + '</select></label>';
+}
+function salesmenOpts(activeOnly) { return S.meta.salesmen.filter(function (s) { return !activeOnly || s.active; }).map(function (s) { return [s.id, s.name + (s.active ? '' : ' (inactive)')]; }); }
+function pager(p, key) {
+  return '<div class="pager"><span class="muted small">' + p.total + ' result' + (p.total === 1 ? '' : 's') + ' · page ' + p.page + ' of ' + p.pages + '</span><span>' +
+    '<button class="btn ghost sm" data-act="pg" data-k="' + key + '" data-d="-1"' + (p.page <= 1 ? ' disabled' : '') + '>‹ Prev</button> ' +
+    '<button class="btn ghost sm" data-act="pg" data-k="' + key + '" data-d="1"' + (p.page >= p.pages ? ' disabled' : '') + '>Next ›</button></span></div>';
+}
+function drillAttrs(drill) { var at = ''; Object.keys(drill).forEach(function (x) { if (drill[x] !== '' && drill[x] != null) at += ' data-' + x + '="' + esc(drill[x]) + '"'; }); return at + ' data-act="drill"'; }
+function stat(k, v, b, gold, drill) {
+  return '<div class="card stat' + (gold ? ' gold' : '') + (drill ? ' click' : '') + '"' + (drill ? drillAttrs(drill) + ' role="button" tabindex="0" title="Tap to see these orders"' : '') + '><div class="k">' + esc(k) + '</div><div class="v">' + v + '</div>' + (b ? '<div class="b">' + esc(b) + '</div>' : '') + '</div>';
+}
+/* ---------- graphs ---------- */
+var C_G = '#16a05a', C_R = '#d3262e', C_Y = '#f2b705', C_N = '#8a97a0';
+function ringSvg(p, c1, c2, id) {
+  p = Math.max(0, Math.min(100, p || 0)); var C = 2 * Math.PI * 54;
+  return '<svg viewBox="0 0 140 140" class="ring"><defs><linearGradient id="gr' + id + '" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="' + c1 + '"/><stop offset="1" stop-color="' + c2 + '"/></linearGradient></defs>' +
+    '<circle cx="70" cy="70" r="54" class="rg-bg"/><circle cx="70" cy="70" r="54" class="rg-fg" stroke="url(#gr' + id + ')" stroke-dasharray="' + C.toFixed(2) + '" stroke-dashoffset="' + (C * (1 - p / 100)).toFixed(2) + '" style="--full:' + C.toFixed(2) + '" transform="rotate(-90 70 70)"/>' +
+    '<text x="70" y="78" text-anchor="middle" class="rg-t">' + Math.round(p) + '%</text></svg>';
+}
+function donutSvg(parts, total) {
+  var C = 2 * Math.PI * 54, acc = 0, h = '<svg viewBox="0 0 140 140" class="ring"><circle cx="70" cy="70" r="54" class="rg-bg" style="stroke-width:18"/>';
+  if (total > 0) parts.forEach(function (x) {
+    if (!x.v) return; var len = C * x.v / total;
+    h += '<circle cx="70" cy="70" r="54" fill="none" stroke="' + x.c + '" stroke-width="18" stroke-dasharray="' + len.toFixed(2) + ' ' + (C - len).toFixed(2) + '" stroke-dashoffset="' + (-acc).toFixed(2) + '" transform="rotate(-90 70 70)" class="dn-seg"><title>' + esc(x.l) + ': ' + x.v + '</title></circle>'; acc += len;
+  });
+  return h + '<text x="70" y="70" text-anchor="middle" class="dn-n">' + total + '</text><text x="70" y="88" text-anchor="middle" class="dn-l">orders</text></svg>';
+}
+function daysSvg(days) {
+  var W = 700, H = 240, pl = 12, pb = 38, pt = 24, ch = H - pb - pt, n = days.length, bw = (W - pl * 2) / n, max = 1, h;
+  days.forEach(function (d) { max = Math.max(max, d.total); });
+  h = '<svg viewBox="0 0 ' + W + ' ' + H + '" class="dsvg">';
+  for (var g = 0; g <= 4; g++) { var gy = pt + ch - ch * g / 4; h += '<line x1="' + pl + '" x2="' + (W - pl) + '" y1="' + gy + '" y2="' + gy + '" class="gl"/>' + (g ? '<text x="' + (pl + 2) + '" y="' + (gy - 3) + '" class="gt">' + Math.round(max * g / 4) + '</text>' : ''); }
+  days.forEach(function (d, i) {
+    var x = pl + i * bw + bw * 0.16, w = bw * 0.68, y = pt + ch, delay = (i * 0.04).toFixed(2);
+    [['delivered', C_G], ['returns', C_R], ['pending', C_Y], ['cancel', C_N]].forEach(function (sg) {
+      var v = d[sg[0]]; if (!v) return; var hh = v / max * ch; y -= hh;
+      h += '<rect x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" width="' + w.toFixed(1) + '" height="' + hh.toFixed(1) + '" rx="3" fill="' + sg[1] + '" class="bseg" style="animation-delay:' + delay + 's"><title>' + esc(d.d) + ' · ' + sg[0] + ': ' + v + '</title></rect>';
+    });
+    if (d.total) h += '<text x="' + (x + w / 2).toFixed(1) + '" y="' + (y - 5).toFixed(1) + '" text-anchor="middle" class="bv">' + d.total + '</text>';
+    h += '<text x="' + (x + w / 2).toFixed(1) + '" y="' + (H - 18) + '" text-anchor="middle" class="bl">' + esc(d.d.slice(8)) + '</text>' + (d.d.slice(8) === '01' || i === 0 ? '<text x="' + (x + w / 2).toFixed(1) + '" y="' + (H - 5) + '" text-anchor="middle" class="bl2">' + esc(d.d.slice(5, 7)) + '/' + esc(d.d.slice(2, 4)) + '</text>' : '');
+  });
+  return h + '</svg>';
+}
+function hbars(rows) {
+  var max = 1; rows.forEach(function (r) { max = Math.max(max, r.total); });
+  return rows.map(function (r, i) {
+    function seg(v, c, t) { return v ? '<span class="hb-s" style="width:' + (v / max * 100).toFixed(1) + '%;background:' + c + ';animation-delay:' + (i * 0.06).toFixed(2) + 's" title="' + t + ': ' + v + '"></span>' : ''; }
+    return '<div class="hb"><div class="hb-n" title="' + esc(r.name) + '">' + esc(r.name) + '</div><div class="hb-t">' + seg(r.delivered, C_G, 'Delivered') + seg(r.returns, C_R, 'Return') + seg(r.pending, C_Y, 'Pending') + seg(r.cancel || 0, C_N, 'Cancel') + '</div><div class="hb-v">' + r.total + '</div></div>';
+  }).join('') || '<p class="muted small">Abhi data nahi hai.</p>';
+}
+function legend() { return '<div class="lgd"><i style="background:' + C_G + '"></i>Delivered <i style="background:' + C_R + '"></i>Return <i style="background:' + C_Y + '"></i>Pending <i style="background:' + C_N + '"></i>Cancel</div>'; }
+function chartsHtml(d, admin) {
+  var s = d.stats, ch = d.charts || { days: [], couriers: [], months: [] }, dl = s.delivered, rt = s.returns, closed = dl + rt;
+  var pD = closed ? dl / closed * 100 : 0, pR = closed ? rt / closed * 100 : 0;
+  var h = '<h2>Graphs</h2><div class="gwrap">';
+  h += '<div class="gcard gfull dr"><div class="dr-side dr-g"><div class="dr-h">&#9989; Delivered</div>' + ringSvg(pD, '#4ae08f', '#0f7a43', 'd') + '<div class="dr-n">' + dl + '</div><div class="dr-s">Success rate</div></div>' +
+    '<div class="dr-mid"><div class="dr-vs">VS</div><div class="dr-split"><span class="g" style="width:' + pD.toFixed(1) + '%"></span><span class="r" style="width:' + pR.toFixed(1) + '%"></span></div><div class="dr-note">' + closed + ' closed orders (Delivered + Return)</div></div>' +
+    '<div class="dr-side dr-r"><div class="dr-h">&#8617;&#65039; Return</div>' + ringSvg(pR, '#ff6b72', '#b01c24', 'r') + '<div class="dr-n">' + rt + '</div><div class="dr-s">Return rate</div></div></div>';
+  h += '<div class="gcard"><h3>Order status</h3><div class="dn-wrap">' + donutSvg([{ v: dl, c: C_G, l: 'Delivered' }, { v: rt, c: C_R, l: 'Return' }, { v: s.pending, c: C_Y, l: 'Pending' }, { v: s.cancelled, c: C_N, l: 'Cancel' }], s.total) +
+    '<ul class="dn-lg"><li><i style="background:' + C_G + '"></i>Delivered <b>' + dl + '</b></li><li><i style="background:' + C_R + '"></i>Return <b>' + rt + '</b></li><li><i style="background:' + C_Y + '"></i>Pending <b>' + s.pending + '</b></li><li><i style="background:' + C_N + '"></i>Cancel <b>' + s.cancelled + '</b></li></ul></div></div>';
+  h += '<div class="gcard"><h3>Courier ke hisaab se</h3>' + hbars(ch.couriers) + legend() + '</div>';
+  h += '<div class="gcard gfull"><h3>Pichhle 14 din ke orders</h3><div class="wrap">' + daysSvg(ch.days) + '</div>' + legend() + (ch.undated ? '<p class="muted small">' + ch.undated + ' orders par date nahi likhi, wo is graph mein shamil nahi.</p>' : '') + '</div>';
+  if (admin) {
+    var sm = (d.salesmen || []).map(function (r) { return { name: r.name, total: r.total, delivered: r.delivered, returns: r.returns, pending: r.pending, cancel: 0 }; }).sort(function (a, b) { return b.total - a.total; }).slice(0, 8);
+    h += '<div class="gcard"><h3>Salesman performance</h3>' + hbars(sm) + legend() + '</div>';
+    var mx = 1; (ch.months || []).forEach(function (m) { mx = Math.max(mx, m.sales || 0, Math.abs(m.profit || 0)); });
+    h += '<div class="gcard"><h3>Month wise Sales aur Profit</h3>' + ((ch.months || []).map(function (m, i) {
+      return '<div class="mb"><div class="mb-n">' + esc(m.tab) + '</div><div class="mb-r"><span class="mb-s" style="width:' + ((m.sales || 0) / mx * 100).toFixed(1) + '%;animation-delay:' + (i * 0.08).toFixed(2) + 's"></span><em>' + money(m.sales || 0) + '</em></div><div class="mb-r"><span class="mb-p" style="width:' + (Math.abs(m.profit || 0) / mx * 100).toFixed(1) + '%;animation-delay:' + (i * 0.08 + 0.04).toFixed(2) + 's' + ((m.profit || 0) < 0 ? ';background:linear-gradient(90deg,#ff6b72,#b01c24)' : '') + '"></span><em>' + money(m.profit || 0) + '</em></div></div>';
+    }).join('') || '<p class="muted small">Abhi data nahi hai.</p>') + '<div class="lgd"><i style="background:' + C_G + '"></i>Sales <i style="background:#f2b705"></i>Profit</div></div>';
+  }
+  return h + '</div>';
+}
+function lnk(text, drill) { return '<a class="lnk"' + drillAttrs(drill) + ' role="button" tabindex="0">' + text + '</a>'; }
+function ext(a, b) { var o = {}; Object.keys(a).forEach(function (k) { o[k] = a[k]; }); Object.keys(b).forEach(function (k) { o[k] = b[k]; }); return o; }
+
+/* ---------- CSV ---------- */
+function csvCell(v) {
+  if (v == null) return '';
+  var s = String(v);
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = "'" + s;
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function downloadCSV(name, rows) {
+  var text = '\ufeff' + rows.map(function (r) { return r.map(csvCell).join(','); }).join('\r\n');
+  var url = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' })), a = document.createElement('a');
+  a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove(); setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+}
+
+/* ---------- session ---------- */
+function signOutLocal(msg) {
+  S.token = null; S.meta = null; store('gl_token', null); $('#app').hidden = true; $('#login').hidden = false; $('#modals').innerHTML = '';
+  var e = $('#login-err'); if (msg) { e.textContent = msg; e.hidden = false; } else e.hidden = true;
+}
+function doLogin() {
+  var u = $('#lu').value, p = $('#lp').value, e = $('#login-err'); e.hidden = true;
+  $('#lb').disabled = true;
+  call('login', { username: u, password: p }).then(function (d) { S.token = d.token; store('gl_token', d.token); $('#lp').value = ''; return start(); })
+    .catch(function (err) { e.textContent = err.message; e.hidden = false; }).then(function () { $('#lb').disabled = false; });
+}
+function start() {
+  return call('meta').then(function (m) {
+    S.meta = m; $('#login').hidden = true; $('#app').hidden = false; $('#demo').hidden = !m.demo;
+    $('#who').textContent = m.user.displayName + ' · ' + m.user.role; renderSide();
+    if (m.user.mustChange) { passwordModal(true); return; }
+    go(homeView());
+  });
+}
+function passwordModal(forced) {
+  modal({ title: forced ? 'Set a new password' : 'Change password', html: (forced ? '<div class="alert">You must choose a new password before continuing.</div>' : '') +
+    '<label>Current password<input type="password" name="oldPassword" autocomplete="current-password"></label>' +
+    '<label>New password (10+ characters, letters and numbers)<input type="password" name="newPassword" autocomplete="new-password"></label>' +
+    '<label>Repeat new password<input type="password" name="again" autocomplete="new-password"></label>',
+    actions: (forced ? [] : [{ label: 'Cancel', cls: 'ghost', fn: function (m) { m.close(); } }]).concat([{ label: 'Save password', cls: 'gold', fn: function (m) {
+      var v = vals(m.el); if (v.newPassword !== v.again) { toast('The new passwords do not match.', true); return; }
+      return call('changePassword', { oldPassword: v.oldPassword, newPassword: v.newPassword }).then(function () { m.close(); toast('Password changed.'); S.meta.user.mustChange = false; go(homeView()); }).catch(fail);
+    } }]) });
+}
+
+/* ---------- navigation ---------- */
+var NAV = {
+  admin: [['dash', 'Dashboard'], ['orders', 'Orders'], ['pay', 'Salesman Payments'], ['riders', 'Riders'], ['policy', 'Policy & Rules'], ['team', 'Team Logins'], ['settings', 'Settings'], ['audit', 'Activity Log']],
+  staff: [['stdash', 'Dashboard'], ['orders', 'Orders'], ['sriders', 'Riders & Contact']],
+  salesman: [['sdash', 'My Dashboard'], ['sorders', 'My Orders'], ['spay', 'My Payments'], ['sriders', 'Riders & Contact'], ['spolicy', 'Rules & Policy']]
+};
+var BRAND_NAME = 'Z. STORE';   // sidebar ka naam; badalna ho to yahan likhein
+var NAV_ICON = { dash: '&#128202;', sdash: '&#128202;', stdash: '&#128202;', orders: '&#128230;', sorders: '&#128230;', pay: '&#128176;', spay: '&#128176;', riders: '&#127949;', sriders: '&#127949;', policy: '&#128220;', spolicy: '&#128220;', team: '&#128101;', settings: '&#9881;&#65039;', audit: '&#128221;' };
+function renderSide() {
+  var items = NAV[S.meta.user.role];
+  $('#side').innerHTML = '<div class="logo">' + esc(BRAND_NAME) + '</div>' + items.map(function (n) { return '<a data-act="nav" data-v="' + n[0] + '" id="nav-' + n[0] + '"><span class="ico">' + (NAV_ICON[n[0]] || '&#9679;') + '</span>' + esc(n[1]) + '</a>'; }).join('') +
+    '<div class="grow"></div><div class="me">' + esc(S.meta.user.displayName) + '</div><a data-act="pwd"><span class="ico">&#128273;</span>Password badlein</a><a data-act="logout"><span class="ico">&#128682;</span>Sign out</a>';
+}
+function go(v) {
+  S.view = v; document.querySelectorAll('.side a').forEach(function (a) { a.classList.toggle('on', a.id === 'nav-' + v); });
+  $('#side').classList.remove('open');
+  var fn = VIEWS[v]; $('#view').innerHTML = '<p class="muted">Loading…</p>'; if (fn) fn(); $('#view').focus();
+}
+function setView(h) {
+  var v = $('#view'); v.innerHTML = h;
+  try { v.classList.remove('enter'); void v.offsetWidth; v.classList.add('enter'); countUp(v); } catch (e) {}
+}
+/* Dashboard ke numbers 0 se upar chadhte hain (sirf dikhawa; asli value wahi rehti hai) */
+function countUp(root) {
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  root.querySelectorAll('.stat .v').forEach(function (el) {
+    var txt = el.textContent.trim(), m = /^(\D*?)(\d[\d,]*(?:\.\d+)?)(\D*)$/.exec(txt);
+    if (!m) return;
+    var end = Number(m[2].replace(/,/g, '')); if (!isFinite(end) || end <= 0 || end > 1e9) return;
+    var dec = (m[2].split('.')[1] || '').length, t0 = null, dur = 750;
+    function step(ts) {
+      if (t0 === null) t0 = ts;
+      var p = Math.min((ts - t0) / dur, 1), e = 1 - Math.pow(1 - p, 3), cur = p < 1 ? end * e : end;
+      el.textContent = m[1] + cur.toLocaleString('en-PK', { minimumFractionDigits: dec, maximumFractionDigits: dec }) + m[3];
+      if (p < 1) requestAnimationFrame(step); else el.textContent = txt;
+    }
+    requestAnimationFrame(step);
+  });
+}
+function day(s) { return String(s || '').slice(0, 10); }
+function tel(n) { return n ? '<a href="tel:' + esc(String(n).replace(/[^\d+]/g, '')) + '">' + esc(n) + '</a>' : '<span class="muted">—</span>'; }
+/* ===== TRACKING LINK: number par click = courier ki apni tracking site khulti hai ======
+   {n} wale link mein tracking number khud lag jata hai. Jin pages par number URL mein nahi lag sakta
+   (Leopards, PostEx), wahan click par number copy ho jata hai, page mein paste kar dein.
+   Naya courier add karna ho to TRACK_URLS mein ek line barha dein. */
+var TRACK_URLS = [
+  { re: /tcs/i,                        name: 'TCS',           direct: 'https://www.tcsexpress.com/track/{n}', official: '' },
+  { re: /leopard|lcs/i,                name: 'Leopards',      direct: 'https://lcstracking.com/?cn={n}', official: 'https://pk.leopardscourier.com/tracking', label: 'official Leopards page' },
+  { re: /post ?ex/i,                   name: 'PostEx',        direct: 'https://postextracking.pk/track/{n}', official: 'https://postextracking.com.pk/', label: 'dusri tracking site' },
+  { re: /post ?office|pak(istan)? ?post|^post$|\bems\b|\bums\b/i, name: 'Post Office', direct: 'https://ep.gov.pk/emtts/EPTrack_Live.aspx?ArticleIDz={n}', official: 'https://ep.gov.pk/track.asp' }
+];
+function trackInfo(courier) {
+  var c = String(courier || '');
+  for (var i = 0; i < TRACK_URLS.length; i++) if (TRACK_URLS[i].re.test(c)) return TRACK_URLS[i];
+  return { name: c || 'Courier', direct: 'https://t.17track.net/en#nums={n}', official: '' };
+}
+function trackUrl(courier, n) { return trackInfo(courier).direct.replace('{n}', encodeURIComponent(String(n).trim())); }
+function trackLink(courier, n, isRider) {
+  var t = String(n == null ? '' : n).trim();
+  if (!t) return '<span class="muted">—</span>';
+  if (isRider) return esc(t);
+  var info = trackInfo(courier), paste = info.direct.indexOf('{n}') < 0;
+  var h = '<a class="trk" href="' + esc(trackUrl(courier, t)) + '" target="_blank" rel="noopener noreferrer" data-n="' + esc(t) + '"' + (paste ? ' data-paste="1"' : '') + ' title="Click karein: ' + esc(info.name) + ' tracking khulegi' + (paste ? ' (number copy ho jata hai, page mein paste karein)' : '') + '">&#128666; ' + esc(t) + '</a>';
+  if (info.official) h += '<br><a class="trk2" href="' + esc(info.official) + '" target="_blank" rel="noopener noreferrer" data-n="' + esc(t) + '" data-paste="1" title="Dusra tracking page (number copy ho jata hai, paste karein)">' + esc(info.label || 'official page') + ' &#8599;</a>';
+  return h;
+}
+document.addEventListener('click', function (ev) {
+  var a = ev.target && ev.target.closest ? ev.target.closest('a.trk, a.trk2') : null; if (!a) return;
+  try { if (navigator.clipboard) navigator.clipboard.writeText(a.getAttribute('data-n') || ''); } catch (e) {}
+  if (a.getAttribute('data-paste')) toast('Tracking number copy ho gaya — khulne wale page mein paste karein.');
+});
+function stChip(s) { return chip(s); }
+
+/* ---------- filters ---------- */
+function filterBar(key, o) {
+  var f = S.f[key], m = S.meta, h = '<div class="card bar-f" data-fk="' + key + '"><div class="grow2"><label>Search<input data-f="q" value="' + esc(f.q) + '" placeholder="Customer, phone, tracking, product"></label></div>';
+  h += '<div>' + sel('Status', '', ['Pending', 'Delivered', 'Return', 'Cancel'], f.status, 'All').replace('name=""', 'data-f="status"') + '</div>';
+  if (o.salesmen) h += '<div>' + sel('Salesman', '', o.salesmen, f.salesman, 'All').replace('name=""', 'data-f="salesman"') + '</div>';
+  h += '<div>' + sel('Courier / rider', '', o.couriers || [], f.courier, 'All').replace('name=""', 'data-f="courier"') + '</div>';
+  h += '<div>' + sel('Month tab', '', o.tabs || [], f.tab, 'All').replace('name=""', 'data-f="tab"') + '</div>';
+  if (!o.noPay) h += '<div>' + sel('Commission', '', [['paid', 'Paid'], ['unpaid', 'Pending']], f.pay, 'All').replace('name=""', 'data-f="pay"') + '</div>';
+  if (o.admin) h += '<div>' + sel('Courier payment', '', [['paid', 'Received (PAID)'], ['unpaid', 'Pending']], f.cpay, 'All').replace('name=""', 'data-f="cpay"') + '</div>';
+  return h + '<div><button class="btn gold" data-act="applyf" data-k="' + key + '">Apply</button> <button class="btn ghost" data-act="clearf" data-k="' + key + '">Clear</button></div></div>';
+}
+function readFilter(key) { var f = S.f[key]; document.querySelectorAll('[data-fk="' + key + '"] [data-f]').forEach(function (el) { f[el.dataset.f] = el.value; }); f.page = 1; }
+function curFilter(key) { var f = S.f[key], o = {}; ['q', 'status', 'courier', 'tab', 'salesman', 'pay', 'cpay'].forEach(function (k) { if (f[k]) o[k] = f[k]; }); return o; }
+
+function switchCard() {
+  var on = S.meta.statusSwitch;
+  return '<div class="card" style="margin:10px 0"><b>Salesman ko status badalne ki ijazat:</b> <span class="chip ' + (on ? 'ok' : 'bad') + '">' + (on ? 'ON' : 'OFF') + '</span> <button class="btn ' + (on ? 'danger' : 'gold') + ' sm" data-act="toggleSwitch">' + (on ? 'Band karein (OFF)' : 'Chalu karein (ON)') + '</button><div class="muted small">OFF hone par salesman sirf apne orders aur payments dekh sakta hai; Delivered/Return sirf admin ya staff likhte hain.</div></div>';
+}
+var VIEWS = {};
+/* ================= SALESMAN ================= */
+VIEWS.sdash = function () {
+  call('sm_dashboard').then(function (d) {
+    var s = d.stats;
+    setView('<h1>Hello, ' + esc(d.name) + '</h1>' +
+      '<div class="grid">' + stat('Total Orders', s.total, '', 0, {}) + stat('Pending Orders', s.pending, '', 0, { status: 'Pending' }) + stat('Delivered', s.delivered, '', 0, { status: 'Delivered' }) + stat('Return', s.returns, '', 0, { status: 'Return' }) + stat('Cancel', s.cancelled, '', 0, { status: 'Cancel' }) + '</div>' +
+      '<h2>My Commission</h2><div class="grid">' + stat('Total Earned', money(s.earned), s.delivered + ' delivered orders', 1, { status: 'Delivered' }) + stat('Paid', money(s.paid), 'Received by me', 1, { pay: 'paid' }) + stat('Pending', money(s.unpaid), s.unpaidCount + ' orders waiting for payment', 1, { pay: 'unpaid' }) + '</div>' +
+      '<p class="muted small">Tap any box to see those orders.</p><h2>Recent payments</h2>' + payHistory(d.recentPayments) +
+      '<div class="card" style="margin-top:14px"><b>Business number:</b> ' + tel(d.businessPhone) + '</div>');
+  }).catch(fail);
+};
+function payHistory(rows) {
+  return '<div class="wrap"><table class="tbl cards"><thead><tr><th>Payment date</th><th>Amount</th>' + (rows.length && rows[0].count != null ? '<th>Orders</th>' : '') + '</tr></thead><tbody>' +
+    (rows.length ? rows.map(function (p) { return '<tr><td data-l="Date">' + esc(p.date) + '</td><td data-l="Amount"><b>' + money(p.amount) + '</b></td>' + (p.count != null ? '<td data-l="Orders">' + p.count + '</td>' : '') + '</tr>'; }).join('') : '<tr><td colspan="3" class="muted">No payments yet.</td></tr>') + '</tbody></table></div>';
+}
+VIEWS.spay = function () {
+  call('sm_payments').then(function (d) {
+    setView('<h1>My Payments</h1><div class="grid">' + stat('Pending', money(d.unpaid), d.unpaidCount + ' orders', 1, { pay: 'unpaid' }) + stat('Paid', money(d.paidTotal), '', 1, { pay: 'paid' }) + '</div><h2>Payment history</h2>' + payHistory(d.payments));
+  }).catch(fail);
+};
+VIEWS.sorders = function () {
+  var f = S.f.sorders;
+  call('sm_orders', { filter: curFilter('sorders'), page: f.page }).then(function (p) {
+    S.cache.sorders = p;
+    var sum = (f.status === 'Delivered' || f.pay) ? '<div class="card" style="margin-bottom:10px"><b>Commission in these orders:</b> ' + money(p.commTotal) + ' <span class="muted small">(' + p.total + ' orders)</span></div>' : '';
+    setView('<h1>My Orders</h1>' + (p.statusSwitch ? '' : '<div class="alert">Order status (Delivered/Return) is updated by the admin or staff. You can see your orders, tracking and commission here.</div>') + filterBar('sorders', { couriers: p.couriers, tabs: p.tabs }) + sum +
+      '<div class="wrap"><table class="tbl cards"><thead><tr><th>Order</th><th>Customer</th><th>Product / Price</th><th>Courier / Rider</th><th>Tracking</th><th>Status</th><th>Commission</th><th></th></tr></thead><tbody>' +
+      (p.items.length ? p.items.map(function (o) {
+        return '<tr><td data-l="Order"><b class="mono">' + esc(o.orderNo || '—') + '</b><br><span class="muted small">' + esc(o.tab) + '</span><br>' + esc(o.date) + '</td>' +
+          '<td data-l="Customer"><b>' + esc(o.customer) + '</b><br>' + tel(o.phone) + '<br><span class="muted small">' + esc(o.address) + '</span></td>' +
+          '<td data-l="Product">' + esc(o.product) + '<br><b>' + money(o.price) + '</b></td>' +
+          '<td data-l="Courier">' + esc(o.courier || '—') + (o.isRider ? '<br><span class="chip warn">Rider</span> ' + tel(o.riderPhone) : '') + '</td>' +
+          '<td data-l="Tracking" class="mono">' + trackLink(o.courier, o.tracking, o.isRider) + '</td>' +
+          '<td data-l="Status">' + stChip(o.status) + (o.statusDate ? '<br><span class="muted small">' + esc(day(o.statusDate)) + '</span>' : '') + '</td>' +
+          '<td data-l="Commission">' + (o.status === 'Delivered' ? money(o.comm) + '<br>' + (o.paid ? '<span class="chip ok">Paid ' + esc(o.paidDate) + '</span>' : '<span class="chip warn">Pending</span>') : '<span class="muted">—</span>') + '</td>' +
+          '<td class="nowrap">' + (o.canUpdate ? '<button class="btn gold sm" data-act="setSt" data-ref="' + esc(o.ref) + '" data-s="Delivered" data-c="' + esc(o.customer) + '">Delivered</button> <button class="btn ghost sm" data-act="setSt" data-ref="' + esc(o.ref) + '" data-s="Return" data-c="' + esc(o.customer) + '">Return</button>' : (o.status === 'Pending' ? '<span class="muted small">Admin will update</span>' : '<span class="muted small">Locked</span>')) + '</td></tr>';
+      }).join('') : '<tr><td colspan="8" class="muted">No orders found.</td></tr>') + '</tbody></table></div>' + pager(p, 'sorders'));
+  }).catch(fail);
+};
+VIEWS.sriders = function () {
+  call('info').then(function (i) {
+    setView('<h1>Riders &amp; Contact</h1><div class="card"><b>Hamara business number:</b> <span style="font-size:20px">' + tel(i.businessPhone) + '</span></div><h2>Riders</h2><div class="wrap"><table class="tbl cards"><thead><tr><th>Naam</th><th>Number</th></tr></thead><tbody>' +
+      (i.riders.length ? i.riders.map(function (r) { return '<tr><td data-l="Naam"><b>' + esc(r.name) + '</b></td><td data-l="Number">' + tel(r.phone) + '</td></tr>'; }).join('') : '<tr><td colspan="2" class="muted">Abhi koi rider nahi.</td></tr>') + '</tbody></table></div>');
+  }).catch(fail);
+};
+function policyHtml(i) {
+  return '<div class="card" style="white-space:pre-wrap">' + esc(i.policy) + '</div><h2>Commission guide (product ke hisaab se)</h2><p><input id="g-q" placeholder="Product search…" style="max-width:320px"></p><div class="wrap"><table class="tbl cards" id="g-tbl"><thead><tr><th>Product</th><th>Price</th><th>Commission</th></tr></thead><tbody>' +
+    i.guide.map(function (g) { return g.slabs.map(function (s, k) { return '<tr><td data-l="Product">' + (k === 0 ? '<b>' + esc(g.product) + '</b>' : '<span class="muted">' + esc(g.product) + '</span>') + '</td><td data-l="Price">' + esc(s.slab) + '</td><td data-l="Commission"><b>' + money(s.comm) + '</b></td></tr>'; }).join(''); }).join('') + '</tbody></table></div>' +
+    '<div class="card" style="margin-top:14px"><b>Business number:</b> ' + tel(i.businessPhone) + '</div>';
+}
+VIEWS.spolicy = function () { call('info').then(function (i) { setView('<h1>Rules &amp; Policy</h1>' + policyHtml(i)); }).catch(fail); };
+
+/* ================= ADMIN ================= */
+VIEWS.dash = function () {
+  var f = S.f.dash || (S.f.dash = {});
+  call('ad_dashboard', { tab: f.tab || '' }).then(function (d) {
+    var s = d.stats, tb = f.tab ? { tab: f.tab } : {}, dr = function (o) { return ext(tb, o); };
+    setView('<h1>Dashboard</h1>' + switchCard() + '<div class="card bar-f" data-fk="dash"><div>' + sel('Month tab', '', S.meta.tabs, f.tab, 'All months').replace('name=""', 'data-f="tab"') + '</div><div><button class="btn gold" data-act="applyf" data-k="dash">Apply</button></div></div>' +
+      '<div class="grid">' + stat('Total Orders', s.total, '', 0, dr({})) + stat('Pending Orders', s.pending, '', 0, dr({ status: 'Pending' })) + stat('Delivered', s.delivered, '', 0, dr({ status: 'Delivered' })) + stat('Return', s.returns, '', 0, dr({ status: 'Return' })) + stat('Cancel', s.cancelled, '', 0, dr({ status: 'Cancel' })) + '</div>' +
+      '<div class="grid">' + stat('Total Sales', money(s.sales), 'Delivered orders', 1, dr({ status: 'Delivered' })) + stat('Profit', money(s.profit), 'From your Profit column (Delivered + Return)', 1) + stat('Courier Payment Pending', money(d.courierDue.amount), d.courierDue.count + ' delivered orders, courier has not paid yet', 1, dr({ status: 'Delivered', cpay: 'unpaid' })) + '</div>' +
+      '<h2>Salesman Commission</h2><div class="grid">' + stat('Total Earned', money(s.earned), 'All salesmen', 1, dr({ status: 'Delivered' })) + stat('Paid', money(s.paid), '', 1, dr({ pay: 'paid' })) + stat('Pending', money(s.unpaid), s.unpaidCount + ' orders waiting for payment', 1, dr({ pay: 'unpaid' })) + '</div>' +
+      '<p class="muted small">Tap any box or number to see those orders.</p>' +
+      chartsHtml(d, true) + '<h2>By salesman</h2><div class="wrap"><table class="tbl cards"><thead><tr><th>Salesman</th><th>Orders</th><th>Pending Orders</th><th>Delivered</th><th>Return</th><th>Total Earned</th><th>Paid</th><th>Pending</th><th></th></tr></thead><tbody>' +
+      d.salesmen.map(function (r) { var n = r.name === '(blank)' ? '' : r.name; return '<tr><td data-l="Salesman"><b>' + esc(r.name) + '</b>' + (r.hasLogin ? '' : '<br><span class="muted small">no login</span>') + '</td><td data-l="Orders">' + lnk(r.total, dr({ salesman: n })) + '</td><td data-l="Pending Orders">' + lnk(r.pending, dr({ salesman: n, status: 'Pending' })) + '</td><td data-l="Delivered">' + lnk(r.delivered, dr({ salesman: n, status: 'Delivered' })) + '</td><td data-l="Return">' + lnk(r.returns, dr({ salesman: n, status: 'Return' })) + '</td><td data-l="Total Earned">' + lnk(money(r.earned), dr({ salesman: n, status: 'Delivered' })) + '</td><td data-l="Paid">' + lnk(money(r.paid), dr({ salesman: n, pay: 'paid' })) + '</td><td data-l="Pending"><b>' + lnk(money(r.unpaid), dr({ salesman: n, pay: 'unpaid' })) + '</b></td><td>' + (r.unpaid > 0 && n ? '<button class="btn gold sm" data-act="payOne" data-n="' + esc(r.name) + '">Pay</button>' : '') + '</td></tr>'; }).join('') + '</tbody></table></div>');
+  }).catch(fail);
+};
+function ordRows(items) {
+  S.cache.orders = {}; items.forEach(function (o) { S.cache.orders[o.ref] = o; });
+  var st = isStaff();
+  return items.map(function (o) {
+    return '<tr><td data-l="Order"><b class="mono">' + esc(o.orderNo || '—') + '</b><br><span class="muted small">' + esc(o.tab) + ' #' + o.row + '</span><br>' + esc(o.date) + '</td><td data-l="Customer"><b>' + esc(o.customer) + '</b><br>' + tel(o.phone) + '</td>' +
+      '<td data-l="Product">' + esc(o.product) + '<br><b>' + money(o.price) + '</b></td><td data-l="Salesman">' + esc(o.salesman) + '</td><td data-l="Courier">' + esc(o.courier || '—') + '<br><span class="small mono">' + trackLink(o.courier, o.tracking, false) + '</span></td>' +
+      '<td data-l="Status">' + stChip(o.status) + (o.payment.toLowerCase() === 'paid' ? '<br><span class="chip warn">Courier PAID</span>' : '') + (o.sdate ? '<br><span class="muted small">' + esc(day(o.sdate)) + '</span>' : '') + '</td>' +
+      (st ? '' : '<td data-l="Commission">' + (o.status === 'Delivered' ? money(o.comm) + '<br>' + (o.paid ? '<span class="chip ok">Paid</span>' : '<span class="chip warn">Pending</span>') : '—') + '</td><td data-l="Profit">' + (o.profit === '' ? '—' : esc(o.profit)) + '</td>') +
+      '<td class="nowrap"><button class="btn ghost sm" data-act="editOrder" data-ref="' + esc(o.ref) + '">Edit</button></td></tr>';
+  }).join('');
+}
+VIEWS.orders = function () {
+  var f = S.f.orders, m = S.meta;
+  call('ad_orders', { filter: curFilter('orders'), page: f.page }).then(function (p) {
+    var sum = (!isStaff() && (f.status === 'Delivered' || f.pay)) ? '<div class="card" style="margin-bottom:10px"><b>Salesman commission in these orders:</b> ' + money(p.commTotal) + ' <span class="muted small">(' + p.total + ' orders)</span></div>' : '';
+    setView('<h1>Orders</h1><p><button class="btn gold" data-act="newOrder">+ New order</button> <button class="btn ghost" data-act="exportOrders">Export (CSV)</button>' + (isAdmin() ? ' <button class="btn ghost" data-act="newMonth">Create new month tab</button>' : '') + '</p><p class="muted small">You can still type orders in the Google Sheet as before; everything shows up here.</p>' +
+      filterBar('orders', { salesmen: m.allSalesmen, couriers: m.couriers, tabs: m.tabs, admin: true, noPay: isStaff() }) + sum + '<div class="wrap"><table class="tbl cards"><thead><tr><th>Order</th><th>Customer</th><th>Product / Price</th><th>Salesman</th><th>Courier / Tracking</th><th>Status</th>' + (isStaff() ? '' : '<th>Commission</th><th>Profit</th>') + '<th></th></tr></thead><tbody>' +
+      (p.items.length ? ordRows(p.items) : '<tr><td colspan="9" class="muted">No orders found.</td></tr>') + '</tbody></table></div>' + pager(p, 'orders'));
+  }).catch(fail);
+};
+function orderModal(o) {
+  var m = S.meta, e = !!o; o = o || { status: 'Pending', date: '' };
+  var h = '<div class="two">' + field('Product', 'Product', o.product) + field('Price', 'Price', o.price === 0 ? '' : o.price, 'inputmode="decimal"') + field('Customer Name', 'CustomerName', o.customer) + field('Phone (do number space se)', 'Phone', o.phone, 'inputmode="tel"') +
+    '<label class="span2">Address<textarea name="Address">' + esc(o.address) + '</textarea></label>' + combo('Saleman (list se chunein ya naam likhein)', 'Salesman', m.salesmen || [], o.salesman, 'Saleman ka naam') + combo('Courier (list se chunein ya likhein)', 'Courier', COURIER_DEFAULTS.concat(m.couriers || []), o.courier, 'TCS / Leopards / PostEx / Post Office') +
+    field('Tracking', 'Tracking', o.tracking) + sel('Status', 'Status', [['Pending', 'Pending (khali)'], 'Delivered', 'Return', 'Cancel'], o.status) + sel('Courier payment', 'Payment', [['', 'Pending (blank)'], ['Paid', 'Received (PAID)']], String(o.payment || '').toLowerCase() === 'paid' ? 'Paid' : '') +
+    field('Date (optional)', 'Date', o.date) + (isStaff() ? '' : field('Product Cost', 'ProductCost', o.pcost, 'inputmode="decimal"') + field('Ads Cost', 'AdsCost', o.ads, 'inputmode="decimal"') + field('Saleman C (commission)', 'Comm', e ? (o.commRaw === '' ? '' : o.comm) : '', 'inputmode="decimal"')) + '</div>' +
+    (e && !isStaff() ? '<div class="two">' + sel('Salesman commission payment', 'SalesmanPaid', [['', 'Pending (blank)'], ['Paid', 'Paid']], o.paid ? 'Paid' : '') + field('Saleman Payment Date', 'SalesmanPaidDate', o.spayDate || '', 'type="date"') + '</div>' : '') +
+    (isStaff() ? '' : '<p class="muted small">Delivery Charges aur Profit aap ki sheet ke formulas khud nikalte hain.' + (e ? ' DC: ' + esc(o.dc || '—') + ' | Profit: ' + esc(o.profit || '—') : '') + '</p>');
+  modal({ title: e ? 'Edit order ' + (o.orderNo ? o.orderNo + ' — ' : '') + o.customer : 'New order', wide: true, html: h, actions: [{ label: 'Cancel', cls: 'ghost', fn: function (m2) { m2.close(); } },
+    { label: 'Save', cls: 'gold', fn: function (m2) { var v = vals(m2.el); if (e) v.ref = o.ref; return call('ad_saveOrder', v).then(function () { m2.close(); toast('Save ho gaya.'); VIEWS.orders(); }).catch(fail); } }] });
+}
+function exportOrders() {
+  call('ad_orders', { filter: curFilter('orders'), forExport: true }).then(function (p) {
+    var h = isStaff() ? ['tab', 'row', 'date', 'product', 'price', 'customer', 'address', 'phone', 'salesman', 'courier', 'tracking', 'status', 'payment'] : ['tab', 'row', 'date', 'product', 'price', 'customer', 'address', 'phone', 'salesman', 'courier', 'tracking', 'status', 'payment', 'pcost', 'ads', 'dc', 'comm', 'profit', 'spay', 'spayDate'];
+    downloadCSV('orders-' + S.meta.today + '.csv', [h].concat(p.items.map(function (o) { return h.map(function (k) { return o[k]; }); })));
+  }).catch(fail);
+}
+
+VIEWS.stdash = function () {
+  var f = S.f.stdash || (S.f.stdash = {});
+  call('st_dashboard', { tab: f.tab || '' }).then(function (d) {
+    var s = d.stats;
+    setView('<h1>Dashboard</h1><div class="card bar-f" data-fk="stdash"><div>' + sel('Month tab', '', S.meta.tabs, f.tab, 'Sab months').replace('name=""', 'data-f="tab"') + '</div><div><button class="btn gold" data-act="applyf" data-k="stdash">Apply</button></div></div>' +
+      '<div class="grid">' + stat('Total orders', s.total) + stat('Pending', s.pending) + stat('Delivered', s.delivered) + stat('Return', s.returns) + stat('Cancel', s.cancelled) + '</div>' +
+      chartsHtml(d, false) + '<h2>Pending orders courier ke hisaab se</h2><div class="wrap"><table class="tbl cards"><thead><tr><th>Courier / rider</th><th>Pending</th></tr></thead><tbody>' +
+      (d.pendingByCourier.length ? d.pendingByCourier.map(function (x) { return '<tr><td data-l="Courier"><b>' + esc(x.courier) + '</b></td><td data-l="Pending">' + x.count + '</td></tr>'; }).join('') : '<tr><td colspan="2" class="muted">Koi pending order nahi.</td></tr>') + '</tbody></table></div>');
+  }).catch(fail);
+};
+
+/* ---------- admin: salesman payments ---------- */
+VIEWS.pay = function () {
+  call('ad_payments').then(function (d) {
+    setView('<h1>Salesman Payments</h1><p class="muted small"><b>Pending</b> = delivered orders whose commission has not been paid yet (from any month). Tap a number to see those orders.</p>' +
+      '<div class="wrap"><table class="tbl cards"><thead><tr><th>Salesman</th><th>Total Earned</th><th>Paid</th><th>Pending</th><th>Pending orders</th><th></th></tr></thead><tbody>' +
+      d.salesmen.map(function (r) { return '<tr><td data-l="Salesman"><b>' + esc(r.name) + '</b></td><td data-l="Total Earned">' + lnk(money(r.earned), { salesman: r.name, status: 'Delivered' }) + '</td><td data-l="Paid">' + lnk(money(r.paid), { salesman: r.name, pay: 'paid' }) + '</td><td data-l="Pending"><b>' + lnk(money(r.unpaid), { salesman: r.name, pay: 'unpaid' }) + '</b></td><td data-l="Pending orders">' + r.unpaidCount + '</td><td>' + (r.unpaid > 0 ? '<button class="btn gold sm" data-act="payOne" data-n="' + esc(r.name) + '">Pay</button>' : '<span class="muted small">all paid</span>') + '</td></tr>'; }).join('') + '</tbody></table></div>' +
+      '<h2>Payment history</h2><div class="wrap"><table class="tbl cards"><thead><tr><th>Log</th><th>Date</th><th>Salesman</th><th>Orders</th><th>Amount</th><th>Note</th><th>Status</th><th></th></tr></thead><tbody>' +
+      (d.logs.length ? d.logs.map(function (l) { return '<tr><td data-l="Log" class="mono">' + esc(l.LogID) + '</td><td data-l="Date">' + esc(l.PaidDate) + '</td><td data-l="Salesman">' + esc(l.Salesman) + '</td><td data-l="Orders">' + l.OrderCount + '</td><td data-l="Amount">' + money(l.Amount) + '</td><td data-l="Note">' + esc(l.Note) + '</td><td data-l="Status"><span class="chip ' + (l.Status === 'Paid' ? 'ok' : 'warn') + '">' + esc(l.Status) + '</span></td><td>' + (l.Status === 'Paid' ? '<button class="btn ghost sm" data-act="undoPay" data-id="' + esc(l.LogID) + '">Undo</button>' : '') + '</td></tr>'; }).join('') : '<tr><td colspan="8" class="muted">No payments yet.</td></tr>') + '</tbody></table></div>' +
+      '<h2>Previous payments (already paid)</h2><div class="card"><p>If you already paid a salesman for old months, mark those months as <b>Paid</b> here so they do not show as Pending. You will see a preview (who and how much) before anything changes.</p>' +
+      '<p><button class="btn ghost sm" data-act="bulkOld">Select all months before this month</button> <button class="btn ghost sm" data-act="bulkNone">Clear</button></p>' +
+      '<div class="two"><div>' + S.meta.tabs.map(function (t) { return '<label style="font-weight:400"><input type="checkbox" data-bulk="' + esc(t) + '"> ' + esc(t) + '</label>'; }).join('') + '</div><div>' + sel('For which salesman', 'bulkSalesman', S.meta.allSalesmen, '', 'All salesmen') + field('Payment date (when it was paid)', 'bulkDate', S.meta.today, 'type="date"') + '</div></div><button class="btn gold" data-act="bulkPaid">Preview</button></div>' +
+      '<p class="muted small">Tip: you can also type <b>Paid</b> in the "Saleman Payment" column of the sheet; the app understands that too. Do not tick months of a salesman whose old commission is still pending.</p>');
+  }).catch(fail);
+};
+function payModal(name) {
+  call('ad_payDetail', { salesman: name }).then(function (d) {
+    var reqId = uid('pay-');
+    var h = '<p><b>' + esc(name) + '</b> — Pending: <b>' + money(d.total) + '</b> (' + d.items.length + ' orders, oldest first)</p>' +
+      '<div class="two"><label>Amount paying now (Rs)<input id="pm-amt" inputmode="decimal" placeholder="e.g. 10000"></label><label>Selected total<input id="pm-tot" readonly></label>' + field('Payment date', 'paymentDate', S.meta.today, 'type="date"') + field('Note', 'note', '') + '</div>' +
+      '<p class="muted small">Type the amount and the oldest orders are selected automatically, up to that amount. You can also tick orders yourself. Orders you do not select stay Pending.</p>' +
+      '<p><input id="pm-q" placeholder="Search customer, phone, order no, tracking, product…"></p>' +
+      '<div class="wrap"><table class="tbl" id="pm-tbl"><thead><tr><th><input type="checkbox" id="pm-all" checked></th><th>Month</th><th>Customer / Phone</th><th>Product</th><th>Order No / Tracking</th><th>Delivered</th><th>Commission</th></tr></thead><tbody>' +
+      d.items.map(function (o) {
+        var hay = [o.tab, o.customer, o.phone, o.product, o.orderNo, o.tracking].join(' ').toLowerCase();
+        return '<tr data-s="' + esc(hay) + '"><td><input type="checkbox" data-ref="' + esc(o.ref) + '" data-c="' + o.comm + '" checked></td><td>' + esc(o.tab) + '</td><td><b>' + esc(o.customer) + '</b><br>' + esc(o.phone) + '</td><td>' + esc(o.product) + '</td><td><b class="mono">' + esc(o.orderNo || '—') + '</b><br><span class="muted small mono">' + esc(o.tracking || '—') + '</span></td><td>' + esc(o.delivered || '—') + '</td><td><b>' + money(o.comm) + '</b></td></tr>';
+      }).join('') + '</tbody></table></div>';
+    var m = modal({ title: 'Pay salesman', wide: true, html: h, actions: [{ label: 'Cancel', cls: 'ghost', fn: function (x) { x.close(); } }, { label: 'Mark as Paid', cls: 'gold', fn: function (x) {
+      var refs = [], tot = 0; x.el.querySelectorAll('[data-ref]').forEach(function (c) { if (c.checked) { refs.push(c.dataset.ref); tot += +c.dataset.c; } });
+      if (!refs.length) { toast('Select at least one order.', true); return; }
+      var v = vals(x.el);
+      return confirmDlg('Mark ' + refs.length + ' orders (' + money(Math.round(tot * 100) / 100) + ') as Paid for ' + name + '? "Paid", yellow colour and the date will be written in the sheet.', 'Mark as Paid').then(function (ok) {
+        if (!ok) return;
+        return call('ad_payConfirm', { salesman: name, refs: refs, paymentDate: v.paymentDate, note: v.note, requestId: reqId }).then(function (r) { x.close(); toast('Payment ' + r.log.LogID + ' recorded: ' + money(r.log.Amount)); S.view === 'pay' ? VIEWS.pay() : VIEWS.dash(); })
+          .catch(function (e) { fail(e); x.close(); payModal(name); });
+      });
+    } }] });
+    var recalc = function () { var t = 0; m.el.querySelectorAll('[data-ref]').forEach(function (c) { if (c.checked) t += +c.dataset.c; }); $('#pm-tot', m.el).value = Math.round(t * 100) / 100; };
+    m.el.addEventListener('change', function (e) {
+      if (e.target.id === 'pm-all') { m.el.querySelectorAll('#pm-tbl tbody tr').forEach(function (tr) { if (tr.style.display !== 'none') tr.querySelector('[data-ref]').checked = e.target.checked; }); recalc(); }
+      else if (e.target.hasAttribute('data-ref')) recalc();
+    });
+    m.el.addEventListener('input', function (e) {
+      if (e.target.id === 'pm-q') { var q = e.target.value.toLowerCase().trim(); m.el.querySelectorAll('#pm-tbl tbody tr').forEach(function (tr) { tr.style.display = (!q || tr.dataset.s.indexOf(q) >= 0) ? '' : 'none'; }); return; }
+      if (e.target.id !== 'pm-amt') return; var amt = Number(e.target.value) || 0, run = 0;
+      m.el.querySelectorAll('[data-ref]').forEach(function (c) { var v = +c.dataset.c; if (amt > 0 && run + v <= amt + 0.001) { c.checked = true; run += v; } else c.checked = !(amt > 0) ? c.checked : false; }); recalc();
+    });
+    recalc();
+  }).catch(fail);
+}
+
+/* ---------- admin: riders, policy, team, settings, audit ---------- */
+VIEWS.riders = function () {
+  call('ad_riders').then(function (rs) {
+    S.cache.riders = {}; rs.forEach(function (r) { S.cache.riders[r.RiderID] = r; });
+    setView('<h1>Riders</h1><p><button class="btn gold" data-act="newRider">+ Rider</button></p><p class="muted small">Yeh list salesmen ko “Riders &amp; Contact” mein dikhti hai. Business number: ' + esc(S.meta.businessPhone) + ' (Settings se badlein).</p><div class="wrap"><table class="tbl cards"><thead><tr><th>Naam</th><th>Phone</th><th>Note</th><th>Active</th><th></th></tr></thead><tbody>' +
+      rs.map(function (r) { return '<tr><td data-l="Naam"><b>' + esc(r.Name) + '</b></td><td data-l="Phone">' + tel(r.Phone) + '</td><td data-l="Note">' + esc(r.Note) + '</td><td data-l="Active">' + esc(r.Active) + '</td><td><button class="btn ghost sm" data-act="editRider" data-id="' + esc(r.RiderID) + '">Edit</button></td></tr>'; }).join('') + '</tbody></table></div>');
+  }).catch(fail);
+};
+function riderModal(r) {
+  r = r || { Active: 'Yes' };
+  modal({ title: r.RiderID ? 'Rider edit' : 'Naya rider', html: field('Naam (sheet ke Courier dropdown jaisa)', 'Name', r.Name) + field('Phone number', 'Phone', r.Phone, 'inputmode="tel"') + field('Note', 'Note', r.Note) + sel('Active', 'Active', ['Yes', 'No'], r.Active),
+    actions: [{ label: 'Cancel', cls: 'ghost', fn: function (m) { m.close(); } }, { label: 'Save', cls: 'gold', fn: function (m) { var v = vals(m.el); if (r.RiderID) v.RiderID = r.RiderID; return call('ad_saveRider', v).then(function () { m.close(); VIEWS.riders(); }).catch(fail); } }] });
+}
+VIEWS.policy = function () {
+  call('info').then(function (i) {
+    setView('<h1>Policy &amp; Rules</h1><div class="card"><label>Salesmen ko jo rules/policy dikhani hain (har line alag)<textarea id="pol" style="min-height:220px">' + esc(i.policy) + '</textarea></label><p><button class="btn gold" data-act="savePolicy">Save</button></p></div><p class="muted small">Commission guide “CommissionGuide” tab se aati hai (sheet mein edit kar sakte hain). Neeche wohi hai jo salesman dekhta hai:</p>' + policyHtml(i));
+  }).catch(fail);
+};
+VIEWS.team = function () {
+  call('ad_users').then(function (us) {
+    S.cache.users = {}; us.forEach(function (u) { S.cache.users[u.userId] = u; });
+    setView('<h1>Team logins</h1><p><button class="btn gold" data-act="newUser">+ Naya login</button></p><div class="wrap"><table class="tbl cards"><thead><tr><th>Sheet wala naam</th><th>Username</th><th>Role</th><th>Active</th><th>Last login</th><th></th></tr></thead><tbody>' +
+      us.map(function (u) { return '<tr><td data-l="Naam"><b>' + esc(u.displayName) + '</b></td><td data-l="Username">' + esc(u.username) + '</td><td data-l="Role">' + esc(u.role) + '</td><td data-l="Active">' + (u.active ? '<span class="chip ok">Active</span>' : '<span class="chip bad">Band</span>') + '</td><td data-l="Last login">' + esc(u.lastLogin || '—') + '</td><td class="nowrap">' +
+        '<button class="btn ghost sm" data-act="resetPw" data-id="' + esc(u.userId) + '">Password reset</button> <button class="btn ghost sm" data-act="revoke" data-id="' + esc(u.userId) + '">Sign out everywhere</button> <button class="btn ghost sm" data-act="toggleUser" data-id="' + esc(u.userId) + '">' + (u.active ? 'Band karein' : 'Chalu karein') + '</button></td></tr>'; }).join('') + '</tbody></table></div>' +
+      '<p class="muted small"><b>Zaroori:</b> “Sheet wala naam” bilkul wohi hona chahiye jo sheet ke Saleman column mein likha hai (dropdown se chunein). Isi naam se salesman ko us ke orders milte hain.</p>');
+  }).catch(fail);
+};
+function showTempPw(title, name, pw) {
+  modal({ title: title, html: '<p>Account: <b>' + esc(name) + '</b></p><p>Temporary password (sirf ek dafa dikhta hai):</p><div class="pw">' + esc(pw) + '</div><p class="muted small">Salesman ko pehli dafa login par naya password rakhna hoga.</p>', actions: [{ label: 'Theek hai', cls: 'gold', fn: function (m) { m.close(); } }] });
+}
+VIEWS.settings = function () {
+  call('ad_settings').then(function (rows) {
+    setView('<h1>Settings</h1>' + switchCard() + '<div class="card"><div class="two">' + rows.map(function (r) { return field(r.key, r.key, r.value) + '<p class="muted small">' + esc(r.description) + '</p>'; }).join('') + '</div><button class="btn gold" data-act="saveSettings">Save</button></div>');
+  }).catch(fail);
+};
+VIEWS.audit = function () {
+  var f = S.f.audit;
+  call('ad_audit', { page: f.page, q: f.q || '' }).then(function (p) {
+    setView('<h1>Activity log</h1><div class="card bar-f" data-fk="audit"><div class="grow2"><label>Search<input data-f="q" value="' + esc(f.q) + '"></label></div><div><button class="btn gold" data-act="applyf" data-k="audit">Search</button></div></div><div class="wrap"><table class="tbl cards"><thead><tr><th>Time</th><th>Who</th><th>Action</th><th>Item</th><th>Details</th></tr></thead><tbody>' +
+      p.items.map(function (a) { return '<tr><td data-l="Time" class="nowrap">' + esc(a.Timestamp) + '</td><td data-l="Who">' + esc(a.ActorName) + '</td><td data-l="Action">' + esc(a.Action) + '</td><td data-l="Item">' + esc(a.EntityID) + '</td><td data-l="Details">' + esc(a.Details) + '</td></tr>'; }).join('') + '</tbody></table></div>' + pager(p, 'audit'));
+  }).catch(fail);
+};
+
+/* ---------- actions ---------- */
+var A = {
+  nav: function (d) { go(d.v); },
+  drill: function (d) {
+    var f = { page: 1 }; ['status', 'pay', 'cpay', 'salesman', 'tab'].forEach(function (k) { if (d[k]) f[k] = d[k]; });
+    if (isAdmin() || isStaff()) { S.f.orders = f; go('orders'); } else { S.f.sorders = f; go('sorders'); }
+  },
+  logout: function () { call('logout').catch(function () {}).then(function () { signOutLocal(''); }); },
+  pwd: function () { passwordModal(false); },
+  pg: function (d) { S.f[d.k].page += +d.d; VIEWS[d.k](); },
+  applyf: function (d) { readFilter(d.k); VIEWS[d.k](); },
+  clearf: function (d) { S.f[d.k] = { page: 1 }; VIEWS[d.k](); },
+  setSt: function (d) { confirmDlg(d.c + ' ka order ' + d.s + ' mark karein? Yeh final hai; baad mein sirf admin badal sakta hai.', d.s + ' mark karein').then(function (ok) { if (ok) call('sm_setStatus', { ref: d.ref, status: d.s }).then(function () { toast('Status update ho gaya.'); VIEWS.sorders(); }).catch(function (e) { fail(e); VIEWS.sorders(); }); }); },
+  newMonth: function () {
+    var months = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE', 'JULY', 'AUGUST', 'SEPTEMBER', 'OCTOBER', 'NOVEMBER', 'DECEMBER'], t = S.meta.today.split('-');
+    modal({ title: 'Naye mahine ka tab', html: '<p>Naya tab pichle mahine ke tab ki saaf copy hoga: header, dropdowns aur DC/Profit ke formulas ke saath, lekin koi order nahi.</p>' + sel('Mahina', 'month', months, months[+t[1] - 1]) + field('Saal', 'year', t[0], 'inputmode="numeric"'),
+      actions: [{ label: 'Cancel', cls: 'ghost', fn: function (m) { m.close(); } }, { label: 'Tab banayein', cls: 'gold', fn: function (m) { var v = vals(m.el); return call('ad_createMonthTab', { name: v.month + ' ' + v.year }).then(function (r) { m.close(); toast(r.name + ' ban gaya.'); return call('meta').then(function (mm) { S.meta = mm; VIEWS.orders(); }); }).catch(fail); } }] });
+  },
+  newOrder: function () { orderModal(null); }, editOrder: function (d) { orderModal(S.cache.orders[d.ref]); }, exportOrders: exportOrders,
+  payOne: function (d) { payModal(d.n); },
+  toggleSwitch: function () { var on = !S.meta.statusSwitch; confirmDlg(on ? 'Salesmen ko Delivered/Return karne ki ijazat dein?' : 'Salesmen ka status badalna band karein?', on ? 'ON karein' : 'OFF karein').then(function (ok) { if (ok) call('ad_setStatusSwitch', { on: on }).then(function (r) { S.meta.statusSwitch = r.on; toast('Salesman status switch ' + (r.on ? 'ON' : 'OFF') + ' ho gaya.'); go(S.view); }).catch(fail); }); },
+  bulkOld: function () { var before = S.meta.tabsBeforeCurrent || []; document.querySelectorAll('[data-bulk]').forEach(function (c) { c.checked = before.indexOf(c.dataset.bulk) >= 0; }); },
+  bulkNone: function () { document.querySelectorAll('[data-bulk]').forEach(function (c) { c.checked = false; }); },
+  undoPay: function (d) { confirmDlg('Undo payment ' + d.id + '? The Paid mark and date will be removed from these orders in the sheet.', 'Undo', true).then(function (ok) { if (ok) call('ad_undoPayment', { logId: d.id }).then(function (r) { toast(r.undone + ' orders are Pending again' + (r.skipped ? ' (' + r.skipped + ' skipped)' : '') + '.'); VIEWS.pay(); }).catch(fail); }); },
+  bulkPaid: function () {
+    var tabs = []; document.querySelectorAll('[data-bulk]').forEach(function (c) { if (c.checked) tabs.push(c.dataset.bulk); });
+    if (!tabs.length) { toast('Pehle tabs chunein.', true); return; }
+    var date = $('[name=bulkDate]').value, who = $('[name=bulkSalesman]').value;
+    call('ad_bulkPreview', { tabs: tabs, salesman: who }).then(function (pv) {
+      if (!pv.count) { toast('No pending Delivered orders found in these tabs.', true); return; }
+      modal({ title: 'Preview — orders that will be marked Paid', wide: true, html: '<p>Tabs: <b>' + esc(tabs.join(', ')) + '</b> · Payment date: <b>' + esc(date) + '</b>' + (who ? ' · Salesman: <b>' + esc(who) + '</b>' : '') + '</p>' +
+        '<div class="wrap"><table class="tbl"><thead><tr><th>Salesman</th><th>Orders</th><th>Commission</th></tr></thead><tbody>' + pv.rows.map(function (r) { return '<tr><td><b>' + esc(r.name) + '</b></td><td>' + r.count + '</td><td>' + money(r.amount) + '</td></tr>'; }).join('') + '<tr><td><b>Total</b></td><td><b>' + pv.count + '</b></td><td><b>' + money(pv.amount) + '</b></td></tr></tbody></table></div>' +
+        '<p>All of these will be marked Paid as "already paid". This bulk action cannot be undone. Type <b>YES</b> to confirm:</p><input name="confirm" autocomplete="off">',
+        actions: [{ label: 'Cancel', cls: 'ghost', fn: function (m) { m.close(); } }, { label: 'Mark as Paid', cls: 'danger', fn: function (m) { return call('ad_bulkPaid', { tabs: tabs, salesman: who, paymentDate: date, confirm: vals(m.el).confirm }).then(function (r) { m.close(); toast(r.count + ' orders (' + money(r.amount) + ') marked as Paid.'); VIEWS.pay(); }).catch(fail); } }] });
+    }).catch(fail);
+  },
+  newRider: function () { riderModal(null); }, editRider: function (d) { riderModal(S.cache.riders[d.id]); },
+  savePolicy: function () { call('ad_savePolicy', { text: $('#pol').value }).then(function () { toast('Policy save ho gayi.'); }).catch(fail); },
+  newUser: function () {
+    var names = S.meta.allSalesmen.filter(function (n) { return n; });
+    modal({ title: 'Naya login', html: field('Username (chhote letters)', 'username', '', 'autocapitalize="none"') + sel('Sheet wala naam (dropdown)', 'pick', names, '', '— ya neeche likhein —') + field('Ya naam khud likhein (Staff/Admin ke liye yahin likhein)', 'typed', '') + sel('Role', 'role', [['salesman', 'Salesman'], ['staff', 'Staff (order/status entry, paise nahi dekhta)'], ['admin', 'Admin']], 'salesman'),
+      actions: [{ label: 'Cancel', cls: 'ghost', fn: function (m) { m.close(); } }, { label: 'Banayein', cls: 'gold', fn: function (m) { var v = vals(m.el); return call('ad_createUser', { username: v.username, displayName: (v.role === 'salesman' ? (v.pick || v.typed) : (v.typed || v.pick)), role: v.role }).then(function (r) { m.close(); VIEWS.team(); showTempPw('Login ban gaya', r.user.username, r.tempPassword); }).catch(fail); } }] });
+  },
+  resetPw: function (d) { confirmDlg('Password reset karein? Woh har jagah se sign out ho jayega.', 'Reset').then(function (ok) { if (ok) call('ad_resetPassword', { userId: d.id }).then(function (r) { showTempPw('Password reset', r.user.username, r.tempPassword); }).catch(fail); }); },
+  revoke: function (d) { call('ad_revokeSessions', { userId: d.id }).then(function () { toast('Sign out ho gaya.'); }).catch(fail); },
+  toggleUser: function (d) { var u = S.cache.users[d.id]; confirmDlg((u.active ? 'Band karein: ' : 'Chalu karein: ') + u.displayName + '?', 'Haan').then(function (ok) { if (ok) call('ad_setActive', { userId: d.id, active: !u.active }).then(function () { VIEWS.team(); }).catch(fail); }); },
+  saveSettings: function () { var v = {}; document.querySelectorAll('#view [name]').forEach(function (el) { v[el.name] = el.value; }); call('ad_saveSettings', { values: v }).then(function () { toast('Settings save ho gayi.'); return call('meta').then(function (m) { S.meta = m; VIEWS.settings(); }); }).catch(fail); },
+  payOne2: function () {}
+};
+document.addEventListener('click', function (e) { var t = e.target.closest('[data-act]'); if (!t || t.disabled) return; var fn = A[t.dataset.act]; if (fn) { e.preventDefault(); fn(t.dataset, t); } });
+document.addEventListener('change', function (e) {
+  var el = e.target, bar = el.closest && el.closest('[data-fk]');
+  if (bar && el.hasAttribute('data-f') && (el.tagName === 'SELECT' || el.type === 'date')) { var b = bar.querySelector('[data-act=applyf]'); if (b) b.click(); }
+});
+document.addEventListener('keydown', function (e) { if ((e.key === 'Enter' || e.key === ' ') && e.target.getAttribute && e.target.getAttribute('role') === 'button' && e.target.hasAttribute('data-act')) { e.preventDefault(); e.target.click(); return; }
+  if (e.key === 'Enter' && e.target.closest && e.target.closest('[data-fk]')) { var b = e.target.closest('[data-fk]').querySelector('[data-act=applyf]'); if (b) b.click(); } });
+document.addEventListener('input', function (e) {
+  if (e.target.id !== 'g-q') return; var q = e.target.value.toLowerCase();
+  document.querySelectorAll('#g-tbl tbody tr').forEach(function (tr) { tr.style.display = tr.textContent.toLowerCase().indexOf(q) < 0 ? 'none' : ''; });
+});
+$('#menu').onclick = function () { $('#side').classList.toggle('open'); };
+$('#lb').onclick = doLogin;
+$('#lp').addEventListener('keydown', function (e) { if (e.key === 'Enter') doLogin(); });
+
+/* ---------- boot ---------- */
+var saved = load('gl_token');
+if (saved) { S.token = saved; start().catch(function () { signOutLocal(''); }); } else { $('#login').hidden = false; }
+})();
+</script>
